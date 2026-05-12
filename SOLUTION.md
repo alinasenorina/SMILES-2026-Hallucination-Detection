@@ -122,7 +122,7 @@ Based on the obtained values of $c_k$, two signs are formed.:
 $$f_{\text{cos\_min}} = \min_{k} (c_k)$$
 ```
 Characterizes the maximum "angle of rotation" of the semantic vector between the macro stages of generation. A low value indicates a sudden change in context or cognitive dissonance during the formation of the response.
-* **Global semantic inertia ('inter_cos_mean'):**
+* **Global semantic inertia (`inter_cos_mean`):**
 ``` math
 $$f_{\text{cos\_mean}} = \frac{1}{4} \sum_{k=0}^3 c_k$$
 ```
