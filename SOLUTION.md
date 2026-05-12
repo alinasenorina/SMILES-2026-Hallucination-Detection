@@ -74,13 +74,13 @@ To combat overfitting in conditions of extreme dimensionality ($D=3605$ at $N=68
 
 We performed Accuracy measurements on cross-validation (averaged over 25 folds) to search for a "stability plateau":
 
-| Значение $C$ | Test Accuracy (%) | Тестовый AUROC | Комментарий |
+| value of $C$ | Test Accuracy (%) | AUROC | comment |
 | :--- | :---: | :---: | :--- |
-| $C = 0.001$ | 73.54 % | 77.10 % | **Underfitting:** Слишком жесткий штраф подавляет даже полезные сигналы. |
-| $C = 0.002$ | 75.82 % | 78.45 % | Высокая стабильность, модель начинает видеть семантические оси. |
-| **$C = 0.003$** | **76.26 %** | **79.20 %** | **Sweet Spot:** Оптимальный баланс между смещением и дисперсией. |
-| $C = 0.004$ | 75.21 % | 78.12 % | **Overfitting start:** Модель начинает «запоминать» мелкий шум в весах. |
-| $C = 0.010$ | 73.12 % | 75.80 % | Резкая деградация точности из-за высокой размерности признаков. |
+| $C = 0.001$ | 73.54 % | 77.10 % | **Underfitting:** Too severe a penalty suppresses even useful signals. |
+| $C = 0.002$ | 75.82 % | 78.45 % | High stability, the model begins to see semantic axes. |
+| **$C = 0.003$** | **76.26 %** | **79.20 %** | **Sweet Spot:** The optimal balance between bias and variance. |
+| $C = 0.004$ | 75.21 % | 78.12 % | **Overfitting start:** The model begins to remember the small noise in the scale. |
+| $C = 0.010$ | 73.12 % | 75.80 % | A sharp degradation in accuracy due to the high dimension of the features. |
 
 **Justification of the choice:** The value $C=0.003$ demonstrated the smallest spread (Standard Deviation) between folds and the best result on the Permutation Test. This confirms the conclusions of the study by Hewitt & Liang (2019): in $D \gg N$ scenarios (3,603 features vs 689 samples), only an extremely strong $L_2$-regularization ensures the "selectivity" of the probe. **Specifically, $C=0.003$ acts as the primary barrier against catastrophic overfitting.** While the results show a ~10% delta between Train Accuracy (86.41%) and Test Accuracy (76.31%), this gap is "benign" in such a high-dimensional space. A model with default regularization would easily achieve 100% Train Accuracy by memorizing noise, while failing to beat the 70% baseline on Test data. The fact that our probe maintains a stable **Test AUROC of 80.28%** proves that $C=0.003$ forces the weights to ignore thousands of spurious correlations and focus strictly on the narrow, generalizable subspace of "truth" within the mid-layer representations.
 
