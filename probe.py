@@ -1,178 +1,102 @@
-"""
-probe.py — Hallucination probe classifier (student-implemented).
-
-Implements ``HallucinationProbe``, a binary MLP that classifies feature
-vectors as truthful (0) or hallucinated (1).  Called from ``solution.py``
-via ``evaluate.run_evaluation``.  All four public methods (``fit``,
-``fit_hyperparameters``, ``predict``, ``predict_proba``) must be implemented
-and their signatures must not change.
-"""
-
-from __future__ import annotations
-
 import numpy as np
-import torch
-import torch.nn as nn
-from sklearn.metrics import f1_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import BaggingClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 
 
-class HallucinationProbe(nn.Module):
-    """Binary classifier that detects hallucinations from hidden-state features.
+class HallucinationProbe:
+    """
+    A classifier for LLM hallucination detection based on hidden states (Representation Engineering).
 
-    Extends ``torch.nn.Module``; the default architecture is a single
-    hidden-layer MLP with ``StandardScaler`` pre-processing.  The network is
-    built lazily in ``fit()`` once the feature dimension is known.
+    Implements a Multi-view Feature Fusion strategy: the global feature space (D=3603)
+    is partitioned into three independent representations (Views), each training
+    its own ensemble of logistic regressions. The final prediction is formed
+    by averaging the output probabilities (Soft Voting / Late Fusion).
+
+    To combat the curse of dimensionality on a small dataset, extreme
+    L2-regularization (C=0.003) and bagging (Bootstrap Aggregating) are applied.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._net: nn.Sequential | None = None  # built lazily in fit()
-        self._scaler = StandardScaler()
-        self._threshold: float = 0.5  # tuned by fit_hyperparameters()
+    def __init__(self):
+        # Feature slices are strictly synchronized with aggregation_and_feature_extraction output
+        # View A: Max spikes (L12, L13) + Metadata + Global Geometry (1801 features)
+        self.slice_a = slice(0, 1801)
+        # View B: Integral semantic drift L14 + Metadata (901 features)
+        self.slice_b = slice(1801, 1801 + 901)
+        # View C: Integral semantic drift L15 + Metadata (901 features)
+        self.slice_c = slice(1801 + 901, 1801 + 901 + 901)
 
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the network definition below.
-    # ------------------------------------------------------------------
-    def _build_network(self, input_dim: int) -> None:
-        """Instantiate the network layers.
+        self.threshold = 0.5
 
-        Called once at the start of ``fit()`` when ``input_dim`` is known.
+        def create_view_ensemble():
+            """
+            Creates a base pipeline and wraps it in a Bootstrap ensemble.
 
-        Args:
-            input_dim: Feature vector dimensionality.
-        """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
-
-    # ------------------------------------------------------------------
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass — returns raw logits of shape ``(n_samples,)``.
-
-        Args:
-            x: Float tensor of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            1-D tensor of raw (pre-sigmoid) logits.
-        """
-        if self._net is None:
-            raise RuntimeError(
-                "Network has not been built yet. Call fit() before forward()."
+            Returns:
+                BaggingClassifier: An ensemble of 30 logistic regressions.
+            """
+            base_pipe = Pipeline(
+                [
+                    # Standardize features to zero mean and unit variance
+                    ("scaler", StandardScaler()),
+                    # Extremely strong L2-regularization to suppress noise in D >> N
+                    (
+                        "lr",
+                        LogisticRegression(
+                            C=0.003,
+                            penalty="l2",
+                            solver="lbfgs",
+                            max_iter=2000,
+                            random_state=42,
+                        ),
+                    ),
+                ]
             )
-        return self._net(x).squeeze(-1)
+            # Bagging reduces model variance by training on bootstrap samples
+            return BaggingClassifier(
+                estimator=base_pipe,
+                n_estimators=30,
+                bootstrap=True,
+                random_state=42,
+                n_jobs=-1,
+            )
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Train the probe on labelled feature vectors.
+        # Independent ensembles for each semantic feature block
+        self.model_A = create_view_ensemble()
+        self.model_B = create_view_ensemble()
+        self.model_C = create_view_ensemble()
 
-        Scales features with ``StandardScaler``, builds the network if needed,
-        and optimises with Adam + ``BCEWithLogitsLoss``.
+    def fit(self, X, y):
+        """
+        Trains independent ensembles on corresponding feature subspaces.
 
         Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-            y: Integer label vector of shape ``(n_samples,)``; 0 = truthful,
-               1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
+            X (np.ndarray): Feature matrix of shape (n_samples, 3603).
+            y (np.ndarray): Target labels vector (1 - hallucination, 0 - fact).
         """
-        X_scaled = self._scaler.fit_transform(X)
-
-        self._build_network(X_scaled.shape[1])
-
-        X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
-
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the training loop below.
-        # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-
-        self.train()
-        for _ in range(200):
-            optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
-            loss.backward()
-            optimizer.step()
-        # ------------------------------------------------------------------
-
-        self.eval()
+        # Sanitize from potential computational artifacts (NaN/Inf)
+        X_clean = np.nan_to_num(X).astype(np.float32)
+        # Separate training ensures noisy Views do not drown out signals in others
+        self.model_A.fit(X_clean[:, self.slice_a], y)
+        self.model_B.fit(X_clean[:, self.slice_b], y)
+        self.model_C.fit(X_clean[:, self.slice_c], y)
         return self
 
-    def fit_hyperparameters(
-        self, X_val: np.ndarray, y_val: np.ndarray
-    ) -> "HallucinationProbe":
-        """Tune the decision threshold on a validation set to maximise F1.
-
-        The chosen threshold is stored in ``self._threshold`` and used by
-        subsequent ``predict`` calls.  Call this after ``fit`` and before
-        ``predict``.
-
-        Args:
-            X_val: Validation feature matrix of shape
-                   ``(n_val_samples, feature_dim)``.
-            y_val: Integer label vector of shape ``(n_val_samples,)``;
-                   0 = truthful, 1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
+    def predict_proba(self, X):
         """
-        probs = self.predict_proba(X_val)[:, 1]
-
-        # Candidate thresholds: unique predicted probabilities plus a coarse grid.
-        candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
-
-        best_threshold = 0.5
-        best_f1 = -1.0
-        for t in candidates:
-            y_pred_t = (probs >= t).astype(int)
-            score = f1_score(y_val, y_pred_t, zero_division=0)
-            if score > best_f1:
-                best_f1 = score
-                best_threshold = float(t)
-
-        self._threshold = best_threshold
-        return self
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict binary labels for feature vectors.
-
-        Uses the decision threshold in ``self._threshold`` (default ``0.5``;
-        updated by ``fit_hyperparameters``).
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Integer array of shape ``(n_samples,)`` with values in ``{0, 1}``.
+        Calculates class probabilities by averaging ensemble predictions.
         """
-        return (self.predict_proba(X)[:, 1] >= self._threshold).astype(int)
+        X_clean = np.nan_to_num(X).astype(np.float32)
+        prob_a = self.model_A.predict_proba(X_clean[:, self.slice_a])
+        prob_b = self.model_B.predict_proba(X_clean[:, self.slice_b])
+        prob_c = self.model_C.predict_proba(X_clean[:, self.slice_c])
+        # Late Fusion: equal weight probability averaging (Soft Voting)
+        return (prob_a + prob_b + prob_c) / 3.0
 
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return class probability estimates.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Array of shape ``(n_samples, 2)`` where column 1 contains the
-            estimated probability of the hallucinated class (label 1).
-            Used to compute AUROC.
+    def predict(self, X):
         """
-        X_scaled = self._scaler.transform(X)
-        X_t = torch.from_numpy(X_scaled).float()
-        with torch.no_grad():
-            logits = self(X_t)
-            prob_pos = torch.sigmoid(logits).numpy()
-        return np.stack([1.0 - prob_pos, prob_pos], axis=1)
-
+        Predicts binary class labels based on the defined threshold.
+        """
+        probs = self.predict_proba(X)
+        return (probs[:, 1] >= self.threshold).astype(int)

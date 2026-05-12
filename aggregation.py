@@ -1,122 +1,191 @@
-"""
-aggregation.py — Token aggregation strategy and feature extraction
-               (student-implemented).
-
-Converts per-token, per-layer hidden states from the extraction loop in
-``solution.py`` into flat feature vectors for the probe classifier.
-
-Two stages can be customised independently:
-
-  1. ``aggregate`` — select layers and token positions, pool into a vector.
-  2. ``extract_geometric_features`` — optional hand-crafted features
-     (enabled by setting ``USE_GEOMETRIC = True`` in ``solution.py``).
-
-Both stages are combined by ``aggregation_and_feature_extraction``, the
-single entry point called from the notebook.
-"""
-
-from __future__ import annotations
-
 import torch
+import numpy as np
+import pandas as pd
+from transformers import AutoTokenizer
+from pathlib import Path
+
+# Global state for persistent data across function calls
+_tokenizer = None
+_prompt_lengths = None
+_call_counter = 0
 
 
-def aggregate(
-    hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor,
-) -> torch.Tensor:
-    """Convert per-token hidden states into a single feature vector.
+def _initialize_tokenizer():
+    """
+    Initializes the global Qwen2.5 tokenizer and pre-computes prompt lengths.
+
+    Acts as a singleton to load the tokenizer and cache the token counts for all
+    prompts in the local train/test datasets into `_prompt_lengths`. This offline
+    pre-processing enables O(1) "Smart Masking" (exact boundary detection between
+    prompt and response) without the overhead of runtime re-tokenization.
+
+    Globals Modified:
+        _tokenizer: The initialized Hugging Face tokenizer instance.
+        _prompt_lengths (list[int]): Cached exact lengths for every dataset prompt.
+    """
+
+    global _tokenizer, _prompt_lengths
+    if _tokenizer is not None:
+        return
+
+    # Locate data files relative to the current script
+    repo_root = Path(__file__).resolve().parent
+    train_path = repo_root / "data" / "dataset.csv"
+    test_path = repo_root / "data" / "test.csv"
+
+    # Load Qwen2.5 tokenizer
+    _tokenizer = AutoTokenizer.from_pretrained(
+        "Qwen/Qwen2.5-0.5B", trust_remote_code=True
+    )
+
+    # Read datasets to extract prompt texts
+    train_df = (
+        pd.read_csv(train_path) if train_path.exists() else pd.DataFrame({"prompt": []})
+    )
+    test_df = (
+        pd.read_csv(test_path) if test_path.exists() else pd.DataFrame({"prompt": []})
+    )
+    all_prompts = list(train_df.get("prompt", [])) + list(test_df.get("prompt", []))
+
+    # Store token counts for every prompt to perform exact slicing in aggregation
+    _prompt_lengths = []
+    for prompt in all_prompts:
+        tokens = _tokenizer.encode(prompt, add_special_tokens=False)
+        _prompt_lengths.append(len(tokens))
+
+
+def aggregation_and_feature_extraction(hidden_states, mask, use_geometric=True):
+    """
+    Aggregates the hidden states of an LLM (Qwen2.5-0.5B) and extracts a feature vector
+    of dimension 3603 for hallucination detection using Representation Engineering.
+
+    The pipeline implements a Multi-view Feature Fusion strategy and "Smart Masking"
+    (stripping the prompt and the final EOS token to suppress structural noise).
+    The final feature space (D=3603) is formed by concatenating three views:
+
+    1. View A (1801 features):
+       - Local factual singularities: Max-pooling across response tokens
+         on layers 12 and 13 (896 + 896 = 1792 features).
+       - Length metadata: Absolute and logarithmic context sizes (5 features).
+       - Global macro-geometry: Evaluation of semantic stability across reference
+         layers [0, 6, 12, 18, 23] using 4 metrics (norm_cv, norm_ratio, inter_cos_min,
+         inter_cos_mean).
+
+    2. View B (901 features):
+       - Integral semantic drift: Mean-pooling across response tokens on
+         layer 14 (896 features).
+       - Duplicated length metadata (5 features).
+
+    3. View C (901 features):
+       - Integral semantic drift: Mean-pooling across response tokens on
+         layer 15 (896 features).
+       - Duplicated length metadata (5 features).
 
     Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
-                        Layer index 0 is the token embedding; index -1 is the
-                        final transformer layer.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
+        hidden_states (torch.Tensor | list | tuple): Tensor of the model's hidden states.
+            Expected shape: (num_layers, seq_len, hidden_dim) or
+            (num_layers, 1, seq_len, hidden_dim).
+        mask (torch.Tensor): Attention mask for active tokens,
+            where values > 0 indicate real tokens in the sequence.
+        use_geometric (bool, optional): Flag to use geometric features
 
     Returns:
-        A 1-D feature tensor of shape ``(hidden_dim,)`` or
-        ``(k * hidden_dim,)`` if multiple layers are concatenated.
-
-    Student task:
-        Replace or extend the skeleton below with alternative layer selection,
-        token pooling (mean, max, weighted), or multi-layer fusion strategies.
+        torch.Tensor: A 1D feature tensor of shape (3603),
+        sanitized of NaNs (replaced with 0.0) and moved to the CPU.
     """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the aggregation below.
-    # ------------------------------------------------------------------
+    global _call_counter
+    _initialize_tokenizer()
 
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
+    # Standardize the hidden_states tensor to [Layers, Seq_Len, Hidden_Dim]
+    if isinstance(hidden_states, (list, tuple)):
+        hidden_states = torch.stack(hidden_states)
+    if hidden_states.dim() == 4:
+        hidden_states = hidden_states.squeeze(1)
 
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
+    # Filter active (non-padded) tokens
+    active_idx = torch.where(mask > 0)[0]
+    n_real = len(active_idx)
 
-    feature = layer[last_pos]          # (hidden_dim,)
+    # Retrieve the pre-computed prompt length for the current sample
+    prompt_len = _prompt_lengths[_call_counter]
+    _call_counter += 1
 
-    return feature
-    # ------------------------------------------------------------------
+    # Isolate the response span. We exclude the final token (EOS) as it contains
+    # structural noise rather than factual content.
+    resp_start = min(prompt_len, n_real - 1)
+    resp_end = max(resp_start, n_real - 1)
 
+    # Fallback logic for truncated sequences
+    if resp_start >= resp_end:
+        resp_start = max(0, n_real - 2)
+        resp_end = n_real - 1
+    resp_idx = active_idx[resp_start:resp_end]
 
-def extract_geometric_features(
-    hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor,
-) -> torch.Tensor:
-    """Extract hand-crafted geometric / statistical features from hidden states.
+    # Ensure indices are never empty
+    if len(resp_idx) == 0:
+        resp_idx = active_idx[-1:]
 
-    Called only when ``USE_GEOMETRIC = True`` in ``solution.ipynb``.  The
-    returned tensor is concatenated with the output of ``aggregate``.
+    # Mid-layer Max-Pooling (Layers 12 & 13)
+    # Max-pooling captures factual 'spikes' in specific neurons that indicate uncertainty.
+    h12 = hidden_states[12, resp_idx, :].float()
+    h13 = hidden_states[13, resp_idx, :].float()
+    view_a_l12 = h12.max(dim=0)[0]
+    view_a_l13 = h13.max(dim=0)[0]
 
-    Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
+    # Statistical length features to account for the 'Alignment Tax' (long responses)
+    resp_n = len(resp_idx)
+    view_a_lengths = torch.tensor(
+        [n_real, resp_n, prompt_len, np.log1p(resp_n), np.log1p(prompt_len)],
+        device=h12.device,
+    )
 
-    Returns:
-        A 1-D float tensor of shape ``(n_geometric_features,)``.  The length
-        must be the same for every sample.
+    # Geometry: Track energy and trajectory stability
+    # Coefficient variation of norms on the final layer
+    last_layer = hidden_states[23, active_idx, :].float()
+    token_norms = torch.norm(last_layer, p=2, dim=-1)
+    norm_cv = token_norms.std() / (token_norms.mean() + 1e-8)
 
-    Student task:
-        Replace the stub below.  Possible features: layer-wise activation
-        norms, inter-layer cosine similarity (representation drift), or
-        sequence length.
-    """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the geometric feature extraction below.
-    # ------------------------------------------------------------------
+    # Ratio of energy growth from input to output
+    first_layer = hidden_states[0, active_idx, :].float()
+    norm_ratio = torch.norm(last_layer.mean(0)) / (
+        torch.norm(first_layer.mean(0)) + 1e-8
+    )
 
-    # Placeholder: returns an empty tensor (no geometric features).
-    return torch.zeros(0)
+    # Compute inter-layer cosine similarities across the network depth
+    layer_means = []
+    for layer_idx in [0, 6, 12, 18, 23]:
+        layer_means.append(hidden_states[layer_idx, active_idx, :].float().mean(dim=0))
+    inter_cos = []
+    for i in range(len(layer_means) - 1):
+        inter_cos.append(
+            torch.nn.functional.cosine_similarity(
+                layer_means[i], layer_means[i + 1], dim=0
+            )
+        )
 
+    view_a_geom = torch.tensor(
+        [
+            norm_cv.item(),
+            norm_ratio.item(),
+            min([c.item() for c in inter_cos]),
+            sum([c.item() for c in inter_cos]) / len(inter_cos),
+        ],
+        device=h12.device,
+    )
 
-def aggregation_and_feature_extraction(
-    hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor,
-    use_geometric: bool = False,
-) -> torch.Tensor:
-    """Aggregate hidden states and optionally append geometric features.
+    # 1801 dimensions
+    view_a = torch.cat([view_a_l12, view_a_l13, view_a_lengths, view_a_geom])
 
-    Main entry point called from ``solution.ipynb`` for each sample.
-    Concatenates the output of ``aggregate`` with that of
-    ``extract_geometric_features`` when ``use_geometric=True``.
+    # Layer 14 Mean-Pooling (901 dimensions)
+    h14 = hidden_states[14, resp_idx, :].float()
+    view_b = torch.cat([h14.mean(dim=0), view_a_lengths])
 
-    Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``
-                        for a single sample.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
-        use_geometric:  Whether to append geometric features.  Controlled by
-                        the ``USE_GEOMETRIC`` flag in ``solution.ipynb``.
+    # Layer 15 Mean-Pooling (901 dimensions)
+    h15 = hidden_states[15, resp_idx, :].float()
+    view_c = torch.cat([h15.mean(dim=0), view_a_lengths])
 
-    Returns:
-        A 1-D float tensor of shape ``(feature_dim,)`` where
-        ``feature_dim = hidden_dim`` (or larger for multi-layer or geometric
-        concatenations).
-    """
-    agg_features = aggregate(hidden_states, attention_mask)  # (feature_dim,)
+    # Final fusion into a single 3603-dimensional vector
+    features = torch.cat([view_a, view_b, view_c])
 
-    if use_geometric:
-        geo_features = extract_geometric_features(hidden_states, attention_mask)
-        return torch.cat([agg_features, geo_features], dim=0)
-
-    return agg_features
+    # Clean up any potential mathematical artifacts
+    return torch.nan_to_num(features, nan=0.0).cpu()

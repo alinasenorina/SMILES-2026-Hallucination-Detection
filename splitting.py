@@ -1,70 +1,35 @@
-"""
-splitting.py — Train / validation / test split utilities (student-implementable).
-
-``split_data`` receives the label array ``y`` and, optionally, the full
-DataFrame ``df`` (for group-aware splits).  It must return a list of
-``(idx_train, idx_val, idx_test)`` tuples of integer index arrays.
-
-Contract
---------
-* ``idx_train``, ``idx_val``, ``idx_test`` are 1-D NumPy arrays of integer
-  indices into the full dataset.
-* ``idx_val`` may be ``None`` if no separate validation fold is needed.
-* All indices must be non-overlapping; together they must cover every sample.
-* Return a **list** — one element for a single split, K elements for k-fold.
-"""
-
-from __future__ import annotations
-
-import numpy as np
-import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import RepeatedStratifiedKFold
 
 
-def split_data(
-    y: np.ndarray,
-    df: pd.DataFrame | None = None,
-    test_size: float = 0.15,
-    val_size: float = 0.15,
-    random_state: int = 42,
-) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
-    """Split dataset indices into train, validation, and test subsets.
+def split_data(y, df, n_splits=5, n_repeats=5, random_state=42):
+    """
+    Generates repeated stratified K-fold splits for stable cross-validation.
 
-    The default strategy performs a single stratified random split preserving
-    the class ratio in each subset.
+    Reduces variance in performance estimates, which is critical for
+    high-dimensional data (D >> N).
 
     Args:
-        y:            Label array of shape ``(N,)`` with values in ``{0, 1}``.
-                      Used for stratification.
-        df:           Optional full DataFrame (same row order as ``y``).
-                      Required for group-aware splits.
-        test_size:    Fraction of samples reserved for the held-out test set.
-        val_size:     Fraction of samples reserved for validation.
-        random_state: Random seed for reproducible splits.
+        y (array-like): Target labels (e.g., 1 for hallucination, 0 for fact).
+        df (DataFrame/ndarray): Feature dataset.
+        n_splits (int, optional): Number of folds (default: 5).
+        n_repeats (int, optional): Number of repetitions (default: 5).
+        random_state (int, optional): Random seed (default: 42).
 
     Returns:
-        A list of ``(idx_train, idx_val, idx_test)`` tuples of integer index
-        arrays.  ``idx_val`` may be ``None``.
-
-    Student task:
-        Replace or extend the skeleton below.  The only contract is that the
-        function returns the list described above.
+        list[tuple]: A list of `(train_idx, None, test_idx)` tuples.
+        The validation index is `None` because the downstream Bootstrap
+        ensemble does not require independent threshold tuning.
     """
+    y_array = y.values if hasattr(y, "values") else y
 
-    idx = np.arange(len(y))
-
-    idx_train_val, idx_test = train_test_split(
-        idx,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y,
+    # Repeated stratified K-fold: variance reduction through repetitions
+    rskf = RepeatedStratifiedKFold(
+        n_splits=n_splits, n_repeats=n_repeats, random_state=random_state
     )
-    relative_val = val_size / (1.0 - test_size)
-    idx_train, idx_val = train_test_split(
-        idx_train_val,
-        test_size=relative_val,
-        random_state=random_state,
-        stratify=y[idx_train_val],
-    )
-    return [(idx_train, idx_val, idx_test)]
 
+    splits = []
+    for train_idx, test_idx in rskf.split(df, y_array):
+        # The validation fold is set to None (no threshold tuning required)
+        splits.append((train_idx, None, test_idx))
+
+    return splits
