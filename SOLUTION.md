@@ -88,31 +88,44 @@ We performed Accuracy measurements on cross-validation (averaged over 25 folds) 
 
 Instead of local token-by-token increment analysis, the final architecture uses an assessment of the global topology of hidden states and semantic stability throughout the generation process (from layer 0 to layer 23). 
 
-To extract geometric features ('view_a_geom'), a subset of active tokens is analyzed (including both the prompt and the generated response). Let $N$ be the number of active tokens, $h_{l,i}\in\mathbb{R}^d$ be the hidden state of the $i$th token on the $l$ layer, and $\bar{h}_l=\frac{1}{N}\sum_{i=1}^N h_{l,i}$ is the average activation vector of the $l$ layer.
-
-Four key geometric predictors were identified:
+To extract geometric features ('view_a_geom'), a subset of active tokens is analyzed (including both the prompt and the generated response). Let $N$ be the number of active tokens, $h_{l,i}\in\mathbb{R}^d$ be the hidden state of the i-th token on the $l$ layer, and 
+``` math
+\bar{h}_l=\frac{1}{N}\sum_{i=1}^N h_{l,i}$ 
+```
+is the average activation vector of the $l$ layer. Four key geometric predictors were identified:
 
 #### 1. Coefficient of variation of the final layer token norms (`norm_cv`)
 Evaluates the dispersion of activation energy at the output of the model (layer 23). High variability of norms may indicate structural instability of generation or anomalies in the confidence function of the model.
+
 **Formula:**
-$$f_{\text{norm\_cv}} = \frac{\sigma(\|h_{23}\|_2)}{\mu(\|h_{23}\|_2) + \epsilon}$$
+```math
+$$f_{\text{norm\_cv}} = \frac{\sigma(|h_{23}|_2)}{\mu(|h_{23}|_2) + \epsilon}$$
+```
 Where $\sigma$ is the standard deviation, $\mu$ is the mathematical expectation of $L_2$ is the norm of all active tokens on layer 23, and $\epsilon = 10^{-8}$ is a constant for computational stability.
 
 #### 2. Scaling the activation energy (`norm_ratio`)
 Measures the global change in the amplitude of a semantic signal from the stage of lexical embedding (layer 0) to the stage of final anembedding (layer 23).
 **Formula:**
+``` math
 $$f_{\text{norm\_ratio}} = \frac{\|\bar{h}_{23}\|_2}{\|\bar{h}_0\|_2 + \epsilon}$$
-
+```
 #### 3. Analysis of interlayer semantic jumps (`inter_cos`)
 To estimate the trajectory of hidden states, we allocate a discrete set of support layers $S = [0, 6, 12, 18, 23]$, covering all key processing phases (embedding, syntax, factual plateau, DPO alignment, anembedding). 
 
 For each pair of adjacent support layers, the cosine similarity of their averaged representations is calculated.:
+``` math
 $$c_k = \frac{\bar{h}_{S_k} \cdot \bar{h}_{S_{k+1}}}{\|\bar{h}_{S_k}\|_2 \|\bar{h}_{S_{k+1}}\|_2}, \quad k \in \{0, 1, 2, 3\}$$
-
+```
 Based on the obtained values of $c_k$, two signs are formed.:
-* **Peak semantic shift (`inter_cos_min`):** $$f_{\text{cos\_min}} = \min_{k} (c_k)$$
+* **Peak semantic shift (`inter_cos_min`):**
+```math
+$$f_{\text{cos\_min}} = \min_{k} (c_k)$$
+```
 Characterizes the maximum "angle of rotation" of the semantic vector between the macro stages of generation. A low value indicates a sudden change in context or cognitive dissonance during the formation of the response.
-* **Global semantic inertia ('inter_cos_mean'):** $$f_{\text{cos\_mean}} = \frac{1}{4} \sum_{k=0}^3 c_k$$
+* **Global semantic inertia ('inter_cos_mean'):**
+``` math
+$$f_{\text{cos\_mean}} = \frac{1}{4} \sum_{k=0}^3 c_k$$
+```
   The average stability of the withdrawal trajectory.
 
 ### 9. Topological Data Analysis (TDA)
